@@ -164,6 +164,26 @@ class Store:
             await d.execute("UPDATE games SET status='cancelled' WHERE status='active'")
             await d.commit(); return len(rows),sum(x[1] for x in rows)
 
+    async def stop_user_games(self, user_id):
+        async with self.lock, aiosqlite.connect(self.path) as d:
+            await d.execute("BEGIN IMMEDIATE")
+            rows=await (await d.execute(
+                "SELECT bet FROM games WHERE status='active' AND user_id=?",
+                (user_id,)
+            )).fetchall()
+            refunded=sum(int(x[0]) for x in rows)
+            if refunded:
+                await d.execute(
+                    "UPDATE users SET balance=balance+? WHERE user_id=?",
+                    (refunded,user_id)
+                )
+                await d.execute(
+                    "UPDATE games SET status='cancelled' WHERE status='active' AND user_id=?",
+                    (user_id,)
+                )
+            await d.commit()
+            return len(rows),refunded
+
 store=Store(DB)
 
 async def available(m):
@@ -226,6 +246,7 @@ PLAYER_HELP=f"""🎮 <b>Команды игроков</b>
 <code>монета 100 орёл</code> — орёл или решка
 <code>рулетка 100 красное</code> — ставка на цвет
 Ответ на сообщение + <code>дуэль 100</code> — вызвать игрока
+<code>стопигры</code> — завершить только свои активные игры и вернуть ставки
 
 <code>хелп</code> — показать этот список"""
 
@@ -236,7 +257,7 @@ ADMIN_HELP="""🛡 <b>Команды администратора</b>
 Ответ на сообщение + <code>обнулить</code>
 <code>пауза</code> — остановить запуск новых игр
 <code>продолжить</code> — снова разрешить игры
-<code>стопигры</code> — завершить все активные игры и вернуть ставки
+<code>стопигры</code> — завершить все активные игры всех игроков и вернуть ставки
 
 Единственный администратор: @Some_RaNdOmuser"""
 
@@ -310,7 +331,22 @@ async def resume(m):
 @router.message(F.text.lower()=="стопигры")
 async def stopgames(m):
     if admin(m.from_user):
-        c,s=await store.stop_all();await m.reply(f"🛑 Завершено игр: {c}. Возвращено ставок: {s}.")
+        c,s=await store.stop_all()
+        await m.reply(
+            f"🛑 Администратор завершил все активные игры.\n"
+            f"Завершено игр: {c}.\n"
+            f"Возвращено ставок: {s}."
+        )
+    else:
+        c,s=await store.stop_user_games(m.from_user.id)
+        if c == 0:
+            await m.reply("ℹ️ У тебя нет активных игр.")
+        else:
+            await m.reply(
+                f"🛑 Твои активные игры завершены.\n"
+                f"Завершено игр: {c}.\n"
+                f"Возвращено ставок: {s}."
+            )
 
 @router.message(F.text.regexp(RX["dice"]))
 async def dice(m):
