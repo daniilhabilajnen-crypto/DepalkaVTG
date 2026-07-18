@@ -127,6 +127,18 @@ def utc_date():
     return datetime.now(timezone.utc).date()
 
 
+def decode_json(value, default):
+    """asyncpg may return JSON/JSONB as a JSON string unless a codec is configured."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return default
+    return value
+
+
 def daily_quests() -> list[dict]:
     roll = random.random()
     if roll < 0.55:
@@ -185,11 +197,26 @@ class Store:
         return self.pool
 
     async def init(self) -> None:
+        async def init_connection(conn: asyncpg.Connection) -> None:
+            await conn.set_type_codec(
+                "json",
+                encoder=json.dumps,
+                decoder=json.loads,
+                schema="pg_catalog",
+            )
+            await conn.set_type_codec(
+                "jsonb",
+                encoder=json.dumps,
+                decoder=json.loads,
+                schema="pg_catalog",
+            )
+
         self.pool = await asyncpg.create_pool(
             self.url,
             min_size=1,
             max_size=5,
             command_timeout=30,
+            init=init_connection,
         )
         async with self.pool.acquire() as conn:
             await conn.execute("""
@@ -429,14 +456,14 @@ class Store:
                 if row["quest_date"] != utc_date() or row["quests_json"] is None:
                     quests = daily_quests()
                     await conn.execute(
-                        "UPDATE users SET quest_date=$1,quests_json=$2::jsonb "
+                        "UPDATE users SET quest_date=$1,quests_json=$2 "
                         "WHERE user_id=$3",
                         utc_date(),
-                        json.dumps(quests, ensure_ascii=False),
+                        quests,
                         user_id,
                     )
                     return quests
-                return list(row["quests_json"])
+                return list(decode_json(row["quests_json"], []))
 
     async def quest_progress(
         self,
@@ -461,9 +488,9 @@ class Store:
 
         if changed:
             await self.require_pool().execute(
-                "UPDATE users SET quests_json=$1::jsonb,"
+                "UPDATE users SET quests_json=$1,"
                 "balance=balance+$2 WHERE user_id=$3",
-                json.dumps(quests, ensure_ascii=False),
+                quests,
                 reward,
                 user_id,
             )
@@ -573,7 +600,7 @@ class Store:
                     )
                     VALUES(
                         $1,$2,$3,$4,$5,$6,$7,$8,
-                        $9::jsonb,'[]'::jsonb,'active',$10::jsonb
+                        $9,'[]'::jsonb,'active',$10
                     )
                 """,
                     game_id,
@@ -584,8 +611,8 @@ class Store:
                     game_type,
                     bet,
                     payout,
-                    json.dumps(sorted(danger)),
-                    json.dumps(meta or {}),
+                    sorted(danger),
+                    meta or {},
                 )
 
         await self.quest_progress(user.id, "play", 1)
@@ -608,8 +635,8 @@ class Store:
 
         for name, value in fields.items():
             if name in json_fields:
-                assignments.append(f"{name}=${index}::jsonb")
-                value = json.dumps(value)
+                assignments.append(f"{name}=${index}")
+                value = value
             else:
                 assignments.append(f"{name}=${index}")
             values.append(value)
@@ -642,7 +669,7 @@ class Store:
 
                 level = int(row["level"])
                 xp = int(row["xp"]) + xp_gain
-                claimed = list(row["level_rewards_claimed"] or [])
+                claimed = list(decode_json(row["level_rewards_claimed"], []))
                 level_reward = 0
 
                 while xp >= xp_required(level):
@@ -686,7 +713,7 @@ class Store:
                         win_streak=$8,
                         loss_streak=$9,
                         best_win_streak=$10,
-                        level_rewards_claimed=$11::jsonb
+                        level_rewards_claimed=$11
                     WHERE user_id=$12
                 """,
                     level_reward,
@@ -699,7 +726,7 @@ class Store:
                     win_streak,
                     loss_streak,
                     best_streak,
-                    json.dumps(claimed),
+                    claimed,
                     user_id,
                 )
                 return level_reward
@@ -1312,9 +1339,9 @@ async def mine_click_handler(callback: CallbackQuery):
         )
 
     cell = int(raw_cell)
-    danger = set(game["danger"])
-    opened = set(game["opened"])
-    golden = bool(game["meta"].get("golden"))
+    danger = set(decode_json(game["danger"], []))
+    opened = set(decode_json(game["opened"], []))
+    golden = bool(decode_json(game["meta"], {}).get("golden"))
 
     if cell in opened:
         return await callback.answer("Клетка уже открыта.")
@@ -1409,7 +1436,7 @@ async def mines_cash_handler(callback: CallbackQuery):
     )
     await store.quest_progress(game["user_id"], "win", 1)
 
-    golden = bool(game["meta"].get("golden"))
+    golden = bool(decode_json(game["meta"], {}).get("golden"))
     extra = (
         f"\n🎁 Награда за уровень: <b>{level_reward}</b>"
         if level_reward
@@ -1424,8 +1451,8 @@ async def mines_cash_handler(callback: CallbackQuery):
         parse_mode="HTML",
         reply_markup=mines_keyboard(
             game_id,
-            set(game["opened"]),
-            set(game["danger"]),
+            set(decode_json(game["opened"], [])),
+            set(decode_json(game["danger"], [])),
             game["payout"],
             done=True,
             golden=golden,
@@ -1488,8 +1515,8 @@ async def joker_click_handler(callback: CallbackQuery):
         )
 
     cell = int(raw_cell)
-    danger = set(game["danger"])
-    opened = set(game["opened"])
+    danger = set(decode_json(game["danger"], []))
+    opened = set(decode_json(game["opened"], []))
 
     if cell // 3 != len(opened):
         return await callback.answer(
