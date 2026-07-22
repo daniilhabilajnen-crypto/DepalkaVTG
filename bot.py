@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 TOKEN=os.getenv('BOT_TOKEN','').strip(); DATABASE_URL=os.getenv('DATABASE_URL','').strip()
 ADMIN='some_randomuser'; START_BALANCE=2500; FIN_TZ=ZoneInfo('Europe/Helsinki')
-router=Router(); logging.basicConfig(level=logging.INFO)
+router=Router(); logging.basicConfig(level=logging.INFO,format='%(asctime)s | %(levelname)s | %(message)s')
 
 RX={
 'bal':re.compile(r'^(б|баланс)$',re.I),'profile':re.compile(r'^(профиль|profile)$',re.I),
@@ -75,7 +75,23 @@ class Store:
             await c.execute('''CREATE TABLE IF NOT EXISTS games(game_id TEXT PRIMARY KEY,chat_id BIGINT,message_id BIGINT,user_id BIGINT,opponent_id BIGINT NOT NULL DEFAULT 0,game_type TEXT,bet BIGINT,payout BIGINT,danger JSONB NOT NULL DEFAULT '[]'::jsonb,opened JSONB NOT NULL DEFAULT '[]'::jsonb,status TEXT NOT NULL DEFAULT 'active',meta JSONB NOT NULL DEFAULT '{}'::jsonb,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())''')
             await c.execute('''CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)''')
             for k,v in [('paused','0'),('gold_start',''),('gold_end','')]: await c.execute('INSERT INTO settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO NOTHING',k,v)
-            for q in ["ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'player'","ALTER TABLE users ADD COLUMN IF NOT EXISTS grant_date DATE","ALTER TABLE users ADD COLUMN IF NOT EXISTS grant_total BIGINT NOT NULL DEFAULT 0","ALTER TABLE users ADD COLUMN IF NOT EXISTS minus_mine INT NOT NULL DEFAULT 0","ALTER TABLE users ADD COLUMN IF NOT EXISTS lifetime_pct INT NOT NULL DEFAULT 0","ALTER TABLE users ADD COLUMN IF NOT EXISTS lifetime_bought BOOLEAN NOT NULL DEFAULT FALSE","ALTER TABLE users ADD COLUMN IF NOT EXISTS maxbet_boost INT NOT NULL DEFAULT 0","ALTER TABLE users ADD COLUMN IF NOT EXISTS maxbet_until TIMESTAMPTZ"]: await c.execute(q)
+            migrations=[
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'player'",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS grant_date DATE",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS grant_total BIGINT NOT NULL DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS minus_mine INT NOT NULL DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS lifetime_pct INT NOT NULL DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS lifetime_bought BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS maxbet_boost INT NOT NULL DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS maxbet_until TIMESTAMPTZ",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS level_rewards JSONB NOT NULL DEFAULT '[]'::jsonb",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS quests JSONB"
+            ]
+            for q in migrations: await c.execute(q)
+            old_rewards=await c.fetchval("SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='level_rewards_claimed')")
+            old_quests=await c.fetchval("SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='quests_json')")
+            if old_rewards: await c.execute("UPDATE users SET level_rewards=level_rewards_claimed WHERE level_rewards='[]'::jsonb AND level_rewards_claimed IS NOT NULL")
+            if old_quests: await c.execute("UPDATE users SET quests=quests_json WHERE quests IS NULL AND quests_json IS NOT NULL")
     async def close(self):
         if self.pool:await self.pool.close()
     async def ensure(self,u): await self.pool.execute('INSERT INTO users(user_id,username,full_name,balance) VALUES($1,$2,$3,$4) ON CONFLICT(user_id) DO UPDATE SET username=EXCLUDED.username,full_name=EXCLUDED.full_name',u.id,u.username,u.full_name,START_BALANCE)
@@ -194,16 +210,23 @@ class Store:
     async def create_game(self,gid,msg,u,kind,bet,payout,danger,opp=0,meta=None):
         ok,err=await self.validate(u,bet)
         if not ok:return False,err
-        async with self.pool.acquire() as c:
-            async with c.transaction():
-                b=int(await c.fetchval('SELECT balance FROM users WHERE user_id=$1 FOR UPDATE',u.id));
-                if b<bet:return False,'Недостаточно баллов.'
-                await c.execute('UPDATE users SET balance=balance-$1 WHERE user_id=$2',bet,u.id)
-                await c.execute("INSERT INTO games(game_id,chat_id,message_id,user_id,opponent_id,game_type,bet,payout,danger,opened,status,meta) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'[]'::jsonb,'active',$10)",gid,msg.chat.id,msg.message_id,u.id,opp,kind,bet,payout,sorted(danger),meta or {})
-        await self.quest(u.id,'play',1);await self.quest(u.id,'spend',bet)
-        if kind=='mines':await self.quest(u.id,'mines',1)
-        if kind=='joker':await self.quest(u.id,'joker',1)
-        return True,''
+        try:
+            async with self.pool.acquire() as c:
+                async with c.transaction():
+                    b=int(await c.fetchval('SELECT balance FROM users WHERE user_id=$1 FOR UPDATE',u.id))
+                    if b<bet:return False,'Недостаточно баллов.'
+                    await c.execute('UPDATE users SET balance=balance-$1 WHERE user_id=$2',bet,u.id)
+                    await c.execute("INSERT INTO games(game_id,chat_id,message_id,user_id,opponent_id,game_type,bet,payout,danger,opened,status,meta) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'[]'::jsonb,'active',$10)",gid,msg.chat.id,msg.message_id,u.id,opp,kind,bet,payout,sorted(danger),meta or {})
+            try:
+                await self.quest(u.id,'play',1);await self.quest(u.id,'spend',bet)
+                if kind=='mines':await self.quest(u.id,'mines',1)
+                if kind=='joker':await self.quest(u.id,'joker',1)
+            except Exception:
+                logging.exception('Quest update failed after game creation')
+            return True,''
+        except Exception:
+            logging.exception('Game creation failed')
+            return False,'❌ Не удалось создать игру. Ставка не списана.'
     async def game(self,gid):return await self.pool.fetchrow('SELECT * FROM games WHERE game_id=$1',gid)
     async def update_game(self,gid,**kw):
         if not kw:return
@@ -273,7 +296,7 @@ def joker_kb(gid,danger,opened,payout,done=False):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 HELP='''╔══════════════╗\n🎮 <b>КОМАНДЫ</b>\n╚══════════════╝\n\n<code>профиль</code>, <code>б</code>, <code>бонус</code>, <code>задания</code>, <code>магазин</code>\nОтвет + <code>п 500</code>\n\nВсе игры с 1 уровня:\n<code>мины 100</code>\n<code>мега удача 100</code>\n<code>джокер 100</code>\n<code>кости 100</code>\n<code>монета 100 орёл</code>\n<code>рулетка 100 красное</code>\nОтвет + <code>дуэль 100</code>\n<code>стопигры</code>'''
-ADMINHELP='''🛡 <b>АДМИН-КОМАНДЫ</b>\n\nОтвет: <code>выдать 500</code>, <code>снять 500</code>, <code>обнулить</code>\nОтвет: <code>выдать уровень 3</code>, <code>забрать уровень 2</code>, <code>установить уровень 10</code>\nОтвет или username: <code>назначить подадмина</code>, <code>снять подадмина</code>\n<code>золотой дождь</code>\nОтвет: <code>выдать бустер -1 мина</code>, <code>выдать бустер вечная удача</code>, <code>выдать бустер куш 24</code>, <code>выдать бустер куш 48</code>\n<code>пауза</code>, <code>продолжить</code>, <code>стопигры</code>\n\nПодадмин может только выдавать до 1000 баллов за финские сутки.'''
+ADMINHELP='''🛡 <b>АДМИН-КОМАНДЫ</b>\n\nОтвет: <code>выдать 500</code>, <code>снять 500</code>, <code>обнулить</code>\nОтвет: <code>выдать уровень 3</code>, <code>забрать уровень 2</code>, <code>установить уровень 10</code>\nОтвет или username: <code>назначить подадмина</code>, <code>снять подадмина</code>\n<code>золотой дождь</code>\nОтвет: <code>выдать бустер -1 мина</code>, <code>выдать бустер вечная удача</code>, <code>выдать бустер куш 24</code>, <code>выдать бустер куш 48</code>\n<code>пауза</code>, <code>продолжить</code>, <code>стопигры</code>\n\nПодадмин может только выдавать до 1000 баллов за сутки.'''
 
 @router.message(CommandStart())
 @router.message(Command('help'))
@@ -291,12 +314,12 @@ async def profile(m):
     await m.reply(f"👤 <b>ПРОФИЛЬ</b>\n\n🛡 Роль: <b>{'Подадмин' if r['role']=='subadmin' else 'Игрок'}</b>\n🏅 Уровень: <b>{r['level']}</b>\n⭐ XP: <b>{r['xp']}/{xp_need(int(r['level']))}</b>\n💰 Баланс: <b>{r['balance']}</b>\n🎯 Макс. ставка: <b>{max_bet(int(r['level']),boost)}</b>\n🏆 Побед: <b>{r['wins']}</b> | 💀 Поражений: <b>{r['losses']}</b>\n📈 Макс. выигрыш: <b>{r['biggest_win']}</b>\n📉 Макс. проигрыш: <b>{r['biggest_loss']}</b>\n🧿 -1 мина: <b>{r['minus_mine']}</b>\n✨ Вечный бонус: <b>+{r['lifetime_pct']}%</b>\n💼 Куш до: <b>{until}</b>",parse_mode='HTML')
 @router.message(F.text.regexp(RX['bonus']))
 async def bonus(m):
-    ok,b,n=await store.bonus(m.from_user);await m.reply(f"{'🎁 Получено '+str(n) if ok else '⏳ Бонус уже получен'}. Баланс: {b}\nСброс в 00:00 по Финляндии.")
+    ok,b,n=await store.bonus(m.from_user);await m.reply(f"{'🎁 Получено '+str(n) if ok else '⏳ Бонус уже получен'}. Баланс: {b}\nСброс в 00:00.")
 @router.message(F.text.regexp(RX['quests']))
 async def quests(m):
     await store.ensure(m.from_user);qs=await store.quests(m.from_user.id);lines=['📅 <b>ЕЖЕДНЕВНЫЕ ЗАДАНИЯ</b>','']
     for q in qs:lines += [f"{'✅' if q['done'] else '▫️'} {q['title']}",f"   {q['progress']}/{q['target']} · {q['reward']} баллов · {q['xp']} XP"]
-    lines.append('\nСброс в 00:00 по Финляндии.');await m.reply('\n'.join(lines),parse_mode='HTML')
+    lines.append('\nСброс в 00:00.');await m.reply('\n'.join(lines),parse_mode='HTML')
 @router.message(F.text.regexp(RX['shop']))
 async def shop(m):await m.reply('🛒 <b>МАГАЗИН</b>\n\n🧿 -1 мина — 1000: <code>купить -1 мина</code>\n✨ +2% навсегда — 7777: <code>купить вечная удача</code>\n💼 +200 к ставке на 24ч — 500: <code>купить куш 24</code>\n💼 +300 к ставке на 48ч — 700: <code>купить куш 48</code>',parse_mode='HTML')
 async def buymsg(m,k):await store.ensure(m.from_user);ok,t=await store.buy(m.from_user.id,k);await m.reply(('✅ ' if ok else '❌ ')+t)
@@ -402,11 +425,29 @@ async def roulette(m):
 @router.message(F.text.regexp(RX['mines']))
 async def mines(m):
     if not await available(m):return
-    bet=int(RX['mines'].match(m.text).group(2));await store.ensure(m.from_user);reserved=await store.reserve_minus(m.from_user.id);gold=random.random()<(0.5 if await store.gold_active() else 0.005);count=max(1,random.randint(4,6)-(1 if reserved else 0));danger=set(random.sample(range(16),count));gid=secrets.token_hex(4);p=await m.reply('⛏ Подготавливаю поле…');ok,e=await store.create_game(gid,p,m.from_user,'mines',bet,bet,danger,meta={'golden':gold,'minus_reserved':reserved})
-    if not ok:
+    bet=int(RX['mines'].match(m.text).group(2))
+    await store.ensure(m.from_user)
+    reserved=False
+    p=await m.reply('⛏ Подготавливаю поле…')
+    try:
+        reserved=await store.reserve_minus(m.from_user.id)
+        gold=random.random()<(0.5 if await store.gold_active() else 0.005)
+        count=max(1,random.randint(4,6)-(1 if reserved else 0))
+        danger=set(random.sample(range(16),count));gid=secrets.token_hex(4)
+        ok,e=await store.create_game(gid,p,m.from_user,'mines',bet,bet,danger,meta={'golden':gold,'minus_reserved':reserved})
+        if not ok:
+            if reserved:await store.return_minus(m.from_user.id)
+            return await p.edit_text(e)
+        title='🌟 ЗОЛОТЫЕ МИНЫ' if gold else '💣 МИНЫ'
+        text=f'{title}\n\nСтавка: {bet}\nМин: {count}\nМожно забрать: {bet}'
+        if reserved:text+='\n🧿 Активирован -1 мина.'
+        await p.edit_text(text,reply_markup=mines_kb(gid,set(),danger,bet,golden=gold))
+    except Exception:
+        logging.exception('Mines handler failed')
         if reserved:await store.return_minus(m.from_user.id)
-        return await p.edit_text(e)
-    await p.edit_text(f"{'🌟 ЗОЛОТЫЕ МИНЫ' if gold else '💣 МИНЫ'}\n\nСтавка: {bet}\nМин: {count}\nМожно забрать: {bet}"+('\n🧿 Бустер -1 мина активирован.' if reserved else ''),reply_markup=mines_kb(gid,set(),danger,bet,golden=gold))
+        try:await p.edit_text('❌ Не удалось создать поле. Попробуй ещё раз.')
+        except Exception:pass
+
 @router.callback_query(F.data.startswith('mine:'))
 async def mineclick(c):
     _,gid,s=c.data.split(':');g=await store.game(gid)
@@ -495,7 +536,7 @@ async def noop(c):await c.answer('Кнопка неактивна.')
 async def main():
     if not TOKEN:raise RuntimeError('Не найден BOT_TOKEN')
     if not DATABASE_URL:raise RuntimeError('Не найден DATABASE_URL')
-    await store.init();bot=Bot(TOKEN);dp=Dispatcher();dp.include_router(router);await bot.set_my_commands([BotCommand(command='start',description='Запустить'),BotCommand(command='help',description='Команды'),BotCommand(command='adminhelp',description='Админ-команды')])
+    await store.init();logging.info('Bot v8.1 started');bot=Bot(TOKEN);dp=Dispatcher();dp.include_router(router);await bot.set_my_commands([BotCommand(command='start',description='Запустить'),BotCommand(command='help',description='Команды'),BotCommand(command='adminhelp',description='Админ-команды')])
     try:await dp.start_polling(bot)
     finally:await store.close()
 if __name__=='__main__':asyncio.run(main())
